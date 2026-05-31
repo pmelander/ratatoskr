@@ -1,5 +1,9 @@
 # ratatoskr
 
+<p align="center">
+  <img src="ratatoskr.png" alt="Ratatoskr on Yggdrasil" width="420">
+</p>
+
 A topic-based publish/subscribe message broker for Zig — a systems and
 embedded-friendly port of [Subtopic](https://github.com/pmelander/Subtopic).
 
