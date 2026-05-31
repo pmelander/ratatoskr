@@ -81,16 +81,14 @@ pub fn TypedBroker(comptime Payload: type) type {
             }
         }
 
-        inner: pubsub.Broker,
-        /// Maps Handle.id → WrapEntry so WrapCtx objects can be freed on
-        /// unsubscribe, clearTopic, and deinit.
+        inner: pubsub.Broker(.{}),
+        /// Tracks WrapCtx allocations so they can be freed on unsubscribe/deinit.
         wraps: std.AutoHashMap(u64, WrapEntry),
 
         /// Initialise a TypedBroker backed by `allocator`.
-        /// Call `deinit` to release all resources.
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
-                .inner = pubsub.Broker.init(allocator),
+                .inner = pubsub.Broker(.{}).init(allocator),
                 .wraps = std.AutoHashMap(u64, WrapEntry).init(allocator),
             };
         }

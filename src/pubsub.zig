@@ -59,16 +59,24 @@ const Subscriber = struct {
 /// initialise with `.empty`, pass the allocator to every mutating call.
 const SubList = std.ArrayList(Subscriber);
 
-/// Central message router.  Holds all subscription state.
+/// Configuration options for `Broker`.
+pub const BrokerOptions = struct {
+    /// When `true`, the broker copies topic strings into its own allocation.
+    /// Subscribe handles are then valid regardless of the caller's topic
+    /// string lifetime.
+    ///
+    /// When `false` (default), topic slices are borrowed — the caller must
+    /// keep them alive for the lifetime of every Handle returned by `subscribe`.
+    copy_topics: bool = false,
+};
+
+/// Returns a Broker type configured by `options`.
 ///
-/// Typical usage:
+/// The default (non-copying) type is pre-configured as `ratatoskr.Broker` in
+/// the package root.  For a copying variant:
 ///
-///   var broker = Broker.init(allocator);
-///   defer broker.deinit();
-///
-///   const h = try broker.subscribe("app/ui", myCallback, null);
-///   broker.publish("app/ui/button", &some_data);  // myCallback is invoked
-///   broker.unsubscribe(h);
+///   const ratatoskr = @import("ratatoskr");
+///   var broker = ratatoskr.BrokerWith(.{ .copy_topics = true }).init(alloc);
 ///
 /// **Thread safety**: not thread-safe; callers own synchronisation.
 ///
@@ -76,163 +84,198 @@ const SubList = std.ArrayList(Subscriber);
 /// same broker is not supported and triggers a `std.debug.assert` failure in
 /// debug and ReleaseSafe builds.  Design callbacks to defer follow-up publishes
 /// (e.g. via a queue) rather than calling back into the broker directly.
-pub const Broker = struct {
-    allocator: std.mem.Allocator,
-    /// Map from topic string → ordered list of active subscribers.
-    /// Insertion order within each list is preserved; `publish` iterates in
-    /// reverse to achieve LIFO (most-recently-subscribed fires first).
-    cache: std.StringHashMap(SubList),
-    /// Monotonically increasing counter used to generate unique Handle ids.
-    next_id: u64,
-    /// Set to `true` for the duration of a `publish` call.
-    /// Used to detect and reject re-entrant publishes in debug builds.
-    publishing: bool,
+pub fn Broker(comptime options: BrokerOptions) type {
+    return struct {
+        const Self = @This();
 
-    /// Initialise a Broker backed by `allocator`.
-    /// Call `deinit` to release all resources.
-    pub fn init(allocator: std.mem.Allocator) Broker {
-        return .{
-            .allocator = allocator,
-            .cache = std.StringHashMap(SubList).init(allocator),
-            .next_id = 0,
-            .publishing = false,
-        };
-    }
+        allocator: std.mem.Allocator,
+        /// Map from topic string → ordered list of active subscribers.
+        /// Insertion order within each list is preserved; `publish` iterates in
+        /// reverse to achieve LIFO (most-recently-subscribed fires first).
+        ///
+        /// When `options.copy_topics` is true, the map owns its key strings.
+        cache: std.StringHashMap(SubList),
+        /// Monotonically increasing counter used to generate unique Handle ids.
+        next_id: u64,
+        /// Set to `true` for the duration of a `publish` call.
+        /// Used to detect and reject re-entrant publishes in debug builds.
+        publishing: bool,
 
-    /// Release all resources owned by this Broker.
-    /// Any outstanding Handles are invalidated.
-    pub fn deinit(self: *Broker) void {
-        var it = self.cache.valueIterator();
-        while (it.next()) |list| {
-            list.deinit(self.allocator);
+        /// Initialise a Broker backed by `allocator`.
+        /// Call `deinit` to release all resources.
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{
+                .allocator = allocator,
+                .cache = std.StringHashMap(SubList).init(allocator),
+                .next_id = 0,
+                .publishing = false,
+            };
         }
-        self.cache.deinit();
-    }
 
-    /// Register `callback`+`ctx` as a subscriber for `topic`.
-    ///
-    /// Returns a `Handle` that uniquely identifies this subscription.
-    /// `topic` memory must outlive the Handle (the slice is not copied).
-    ///
-    /// Errors:
-    ///   `error.OutOfMemory` — allocation failure; broker state is unchanged.
-    pub fn subscribe(
-        self: *Broker,
-        topic: []const u8,
-        callback: CallbackFn,
-        ctx: ?*anyopaque,
-    ) error{OutOfMemory}!Handle {
-        const gop = try self.cache.getOrPut(topic);
-        if (!gop.found_existing) {
-            gop.value_ptr.* = .empty;
-        }
-        const id = self.next_id;
-        gop.value_ptr.append(self.allocator, .{
-            .id = id,
-            .callback = callback,
-            .ctx = ctx,
-        }) catch |err| {
-            // Roll back the map entry we just created to keep state consistent.
-            if (!gop.found_existing) {
-                gop.value_ptr.deinit(self.allocator);
-                _ = self.cache.remove(topic);
+        /// Release all resources owned by this Broker.
+        /// Any outstanding Handles are invalidated.
+        pub fn deinit(self: *Self) void {
+            var it = self.cache.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+                if (comptime options.copy_topics) {
+                    self.allocator.free(entry.key_ptr.*);
+                }
             }
-            return err;
-        };
-        self.next_id += 1;
-        return .{ .topic = topic, .id = id };
-    }
+            self.cache.deinit();
+        }
 
-    /// Cancel the subscription identified by `handle`.
-    /// Safe to call with a stale or already-unsubscribed handle (no-op).
-    pub fn unsubscribe(self: *Broker, handle: Handle) void {
-        const list = self.cache.getPtr(handle.topic) orelse return;
-        for (list.items, 0..) |sub, i| {
-            if (sub.id == handle.id) {
-                // orderedRemove preserves insertion order so that the reverse-
-                // iteration LIFO guarantee holds after any removal.
-                _ = list.orderedRemove(i);
-                // When the last subscriber leaves, free the backing array and
-                // remove the map entry to keep the cache compact.
-                if (list.items.len == 0) {
-                    if (self.cache.fetchRemove(handle.topic)) |kv| {
-                        var empty = kv.value;
-                        empty.deinit(self.allocator);
+        /// Register `callback`+`ctx` as a subscriber for `topic`.
+        ///
+        /// Returns a `Handle` that uniquely identifies this subscription.
+        ///
+        /// When `options.copy_topics` is false (default), `topic` memory must
+        /// outlive the Handle.  When `options.copy_topics` is true, the broker
+        /// copies the topic string and manages its lifetime independently.
+        ///
+        /// Errors:
+        ///   `error.OutOfMemory` — allocation failure; broker state is unchanged.
+        pub fn subscribe(
+            self: *Self,
+            topic: []const u8,
+            callback: CallbackFn,
+            ctx: ?*anyopaque,
+        ) error{OutOfMemory}!Handle {
+            // Acquire the map entry, duplicating the key when copy_topics is set.
+            const gop = blk: {
+                if (comptime options.copy_topics) {
+                    const owned = try self.allocator.dupe(u8, topic);
+                    const result = self.cache.getOrPut(owned) catch |err| {
+                        self.allocator.free(owned);
+                        return err;
+                    };
+                    // If the topic already existed, free the duplicate we just
+                    // created — the map retains its pre-existing owned key.
+                    if (result.found_existing) self.allocator.free(owned);
+                    break :blk result;
+                } else {
+                    break :blk try self.cache.getOrPut(topic);
+                }
+            };
+            if (!gop.found_existing) {
+                gop.value_ptr.* = .empty;
+            }
+            const id = self.next_id;
+            gop.value_ptr.append(self.allocator, .{
+                .id = id,
+                .callback = callback,
+                .ctx = ctx,
+            }) catch |err| {
+                // Roll back the freshly-created map entry to keep state consistent.
+                if (!gop.found_existing) {
+                    gop.value_ptr.deinit(self.allocator);
+                    if (self.cache.fetchRemove(gop.key_ptr.*)) |kv| {
+                        if (comptime options.copy_topics) self.allocator.free(kv.key);
                     }
                 }
-                return;
+                return err;
+            };
+            self.next_id += 1;
+            return .{ .topic = gop.key_ptr.*, .id = id };
+        }
+
+        /// Cancel the subscription identified by `handle`.
+        /// Safe to call with a stale or already-unsubscribed handle (no-op).
+        pub fn unsubscribe(self: *Self, handle: Handle) void {
+            const list = self.cache.getPtr(handle.topic) orelse return;
+            for (list.items, 0..) |sub, i| {
+                if (sub.id == handle.id) {
+                    // orderedRemove preserves insertion order so that the reverse-
+                    // iteration LIFO guarantee holds after any removal.
+                    _ = list.orderedRemove(i);
+                    // When the last subscriber leaves, free the backing array and
+                    // remove the map entry to keep the cache compact.
+                    if (list.items.len == 0) {
+                        if (self.cache.fetchRemove(handle.topic)) |kv| {
+                            var empty = kv.value;
+                            empty.deinit(self.allocator);
+                            if (comptime options.copy_topics) self.allocator.free(kv.key);
+                        }
+                    }
+                    return;
+                }
             }
         }
-    }
 
-    /// Remove ALL subscriptions for `topic`, freeing the associated list.
-    pub fn clearTopic(self: *Broker, topic: []const u8) void {
-        if (self.cache.fetchRemove(topic)) |kv| {
-            var list = kv.value;
-            list.deinit(self.allocator);
+        /// Remove ALL subscriptions for `topic`, freeing the associated list.
+        pub fn clearTopic(self: *Self, topic: []const u8) void {
+            if (self.cache.fetchRemove(topic)) |kv| {
+                var list = kv.value;
+                list.deinit(self.allocator);
+                if (comptime options.copy_topics) self.allocator.free(kv.key);
+            }
         }
-    }
 
-    /// Deliver `data` to all subscribers of `topic` and every ancestor topic.
-    ///
-    /// Delivery order within a single topic level: most-recently-subscribed
-    /// first (matching Subtopic's reverse-iteration behaviour).
-    /// Ancestor topics are visited from the published topic toward the root.
-    ///
-    /// Calling `publish` re-entrantly from within a callback is not supported
-    /// and panics in debug/ReleaseSafe builds.
-    pub fn publish(
-        self: *Broker,
-        topic: []const u8,
-        data: ?*anyopaque,
-    ) void {
-        std.debug.assert(!self.publishing); // re-entrant publish is not allowed
-        self.publishing = true;
-        defer self.publishing = false;
-        var current: []const u8 = topic;
-        while (true) {
-            if (self.cache.getPtr(current)) |list| {
-                // Iterate in reverse so the most-recently-subscribed fires first.
+        /// Deliver `data` to all subscribers of `topic` and every ancestor topic.
+        ///
+        /// Delivery order within a single topic level: most-recently-subscribed
+        /// first (matching Subtopic's reverse-iteration behaviour).
+        /// Ancestor topics are visited from the published topic toward the root.
+        ///
+        /// Calling `publish` re-entrantly from within a callback is not supported
+        /// and panics in debug/ReleaseSafe builds.
+        pub fn publish(
+            self: *Self,
+            topic: []const u8,
+            data: ?*anyopaque,
+        ) void {
+            std.debug.assert(!self.publishing); // re-entrant publish is not allowed
+            self.publishing = true;
+            defer self.publishing = false;
+            var current: []const u8 = topic;
+            while (true) {
+                if (self.cache.getPtr(current)) |list| {
+                    // Iterate in reverse so the most-recently-subscribed fires first.
+                    var i: usize = list.items.len;
+                    while (i > 0) {
+                        i -= 1;
+                        list.items[i].callback(current, data, list.items[i].ctx);
+                    }
+                }
+                // Strip the rightmost segment to walk up to the parent topic.
+                const sep = std.mem.lastIndexOfScalar(u8, current, TOPIC_SEPARATOR) orelse break;
+                current = current[0..sep];
+            }
+        }
+
+        /// Deliver `data` to subscribers of `topic` only — no ancestor walk.
+        ///
+        /// Use for point-to-point delivery where ancestor topics must not receive
+        /// messages intended for a specific sub-topic.
+        /// Delivery order: most-recently-subscribed first (LIFO), same as `publish`.
+        ///
+        /// Panics on re-entrant calls in debug/ReleaseSafe builds.
+        pub fn publishExact(
+            self: *Self,
+            topic: []const u8,
+            data: ?*anyopaque,
+        ) void {
+            std.debug.assert(!self.publishing); // re-entrant publish is not allowed
+            self.publishing = true;
+            defer self.publishing = false;
+            if (self.cache.getPtr(topic)) |list| {
                 var i: usize = list.items.len;
                 while (i > 0) {
                     i -= 1;
-                    list.items[i].callback(current, data, list.items[i].ctx);
+                    list.items[i].callback(topic, data, list.items[i].ctx);
                 }
             }
-            // Strip the rightmost segment to walk up to the parent topic.
-            const sep = std.mem.lastIndexOfScalar(u8, current, TOPIC_SEPARATOR) orelse break;
-            current = current[0..sep];
         }
-    }
-
-    /// Deliver `data` to subscribers of `topic` only — no ancestor walk.
-    ///
-    /// Use for point-to-point delivery where ancestor topics must not receive
-    /// messages intended for a specific sub-topic.
-    /// Delivery order: most-recently-subscribed first (LIFO), same as `publish`.
-    ///
-    /// Panics on re-entrant calls in debug/ReleaseSafe builds.
-    pub fn publishExact(
-        self: *Broker,
-        topic: []const u8,
-        data: ?*anyopaque,
-    ) void {
-        std.debug.assert(!self.publishing); // re-entrant publish is not allowed
-        self.publishing = true;
-        defer self.publishing = false;
-        if (self.cache.getPtr(topic)) |list| {
-            var i: usize = list.items.len;
-            while (i > 0) {
-                i -= 1;
-                list.items[i].callback(topic, data, list.items[i].ctx);
-            }
-        }
-    }
-};
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+// Convenience alias — all tests that exercise the default (non-copying)
+// configuration use `B` so the call sites stay concise.
+const B = Broker(.{});
 
 // --- shared test callbacks ---
 
@@ -284,12 +327,12 @@ test "Handle has topic and id fields" {
 // --- init / deinit ---
 
 test "Broker.init and deinit do not leak" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 }
 
 test "deinit with active subscriptions does not leak" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     var count: u32 = 0;
     _ = try broker.subscribe("a", counterCb, &count);
     _ = try broker.subscribe("a", counterCb, &count);
@@ -300,7 +343,7 @@ test "deinit with active subscriptions does not leak" {
 // --- subscribe / publish basics ---
 
 test "subscribe and publish — exact match" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -310,13 +353,13 @@ test "subscribe and publish — exact match" {
 }
 
 test "publish is a no-op when no subscribers exist" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
     broker.publish("nothing", null);
 }
 
 test "publish does not fire for an unrelated topic" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -326,7 +369,7 @@ test "publish does not fire for an unrelated topic" {
 }
 
 test "publish passes the data pointer through to the callback" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var cap = DataCapture{};
@@ -339,7 +382,7 @@ test "publish passes the data pointer through to the callback" {
 }
 
 test "multiple subscribers on the same topic all fire" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var a: u32 = 0;
@@ -356,7 +399,7 @@ test "multiple subscribers on the same topic all fire" {
 }
 
 test "delivery order within a topic is LIFO" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var seq: u32 = 0;
@@ -377,7 +420,7 @@ test "LIFO order is preserved after an intermediate unsubscribe" {
     // Regression: swapRemove moved the last element into the removed slot,
     // silently permuting the order seen by reverse iteration.
     // orderedRemove must be used so the relative registration order is stable.
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var seq: u32 = 0;
@@ -408,7 +451,7 @@ test "LIFO order is preserved after an intermediate unsubscribe" {
 // --- hierarchical bubble-up ---
 
 test "hierarchical: full ancestor chain fires on deep publish" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var app: u32 = 0;
@@ -425,7 +468,7 @@ test "hierarchical: full ancestor chain fires on deep publish" {
 }
 
 test "hierarchical: sibling topic does not fire" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -435,7 +478,7 @@ test "hierarchical: sibling topic does not fire" {
 }
 
 test "hierarchical: parent publish does not trickle down to child subscriber" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -445,7 +488,7 @@ test "hierarchical: parent publish does not trickle down to child subscriber" {
 }
 
 test "hierarchical: single-segment publish fires only that topic" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var root: u32 = 0;
@@ -459,7 +502,7 @@ test "hierarchical: single-segment publish fires only that topic" {
 }
 
 test "hierarchical: callback receives its subscribed topic, not the published topic" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var cap = TopicCapture{};
@@ -471,7 +514,7 @@ test "hierarchical: callback receives its subscribed topic, not the published to
 // --- unsubscribe ---
 
 test "unsubscribe stops future delivery" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -486,7 +529,7 @@ test "unsubscribe stops future delivery" {
 }
 
 test "unsubscribe with a stale handle is a no-op" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -496,7 +539,7 @@ test "unsubscribe with a stale handle is a no-op" {
 }
 
 test "unsubscribe removes only the targeted subscriber, leaving others intact" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var a: u32 = 0;
@@ -511,7 +554,7 @@ test "unsubscribe removes only the targeted subscriber, leaving others intact" {
 }
 
 test "unsubscribe last subscriber frees map entry — no leak and publish is safe" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -527,7 +570,7 @@ test "unsubscribe last subscriber frees map entry — no leak and publish is saf
 // --- clearTopic ---
 
 test "clearTopic removes all subscribers for that topic" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var a: u32 = 0;
@@ -542,7 +585,7 @@ test "clearTopic removes all subscribers for that topic" {
 }
 
 test "clearTopic does not affect subscribers on other topics" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var a: u32 = 0;
@@ -558,7 +601,7 @@ test "clearTopic does not affect subscribers on other topics" {
 }
 
 test "clearTopic on an unknown topic is a no-op" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
     broker.clearTopic("never/subscribed");
 }
@@ -575,7 +618,7 @@ test "subscribe is OOM-safe at every allocation point" {
             std.testing.allocator,
             .{ .fail_index = fail_index },
         );
-        var broker = Broker.init(fa.allocator());
+        var broker = B.init(fa.allocator());
         var count: u32 = 0;
         if (broker.subscribe("x", counterCb, &count)) |_| {
             // subscribe succeeded — all failure points have been covered.
@@ -592,7 +635,7 @@ test "subscribe is OOM-safe at every allocation point" {
 test "re-entrancy guard: publishing flag clears after publish returns" {
     // Verifies that sequential publishes succeed — the guard flag is correctly
     // reset via defer even when the subscriber list is non-empty.
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -603,13 +646,13 @@ test "re-entrancy guard: publishing flag clears after publish returns" {
 }
 
 test "re-entrancy guard: flag is false on a broker that has never published" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
     try std.testing.expect(!broker.publishing);
 }
 
 test "re-entrancy guard: flag is false after publish with no subscribers" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
     broker.publish("empty", null);
     try std.testing.expect(!broker.publishing);
@@ -618,7 +661,7 @@ test "re-entrancy guard: flag is false after publish with no subscribers" {
 // --- publishExact ---
 
 test "publishExact fires exact topic only — not ancestors" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var root: u32 = 0;
@@ -632,7 +675,7 @@ test "publishExact fires exact topic only — not ancestors" {
 }
 
 test "publishExact does not trickle down to children" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var child: u32 = 0;
@@ -643,13 +686,13 @@ test "publishExact does not trickle down to children" {
 }
 
 test "publishExact on a topic with no subscribers is a no-op" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
     broker.publishExact("never/subscribed", null);
 }
 
 test "publishExact LIFO order matches publish" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var seq: u32 = 0;
@@ -667,7 +710,7 @@ test "publishExact LIFO order matches publish" {
 }
 
 test "publishExact re-entrancy guard: flag clears after return" {
-    var broker = Broker.init(std.testing.allocator);
+    var broker = B.init(std.testing.allocator);
     defer broker.deinit();
 
     var count: u32 = 0;
@@ -675,4 +718,95 @@ test "publishExact re-entrancy guard: flag clears after return" {
     broker.publishExact("t", null);
     broker.publishExact("t", null); // second call must not hit the assert
     try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+// --- copy_topics option ---
+
+test "copy_topics=true: topic lifetime is independent of the caller's string" {
+    // Allocate a heap string, subscribe, free the string, then publish —
+    // the broker must have made its own copy so there is no use-after-free.
+    const C = Broker(.{ .copy_topics = true });
+    var broker = C.init(std.testing.allocator);
+    defer broker.deinit();
+
+    const heap_topic = try std.testing.allocator.dupe(u8, "sensor/temp");
+    var count: u32 = 0;
+    const h = try broker.subscribe(heap_topic, counterCb, &count);
+    std.testing.allocator.free(heap_topic); // free the original — broker owns its copy
+
+    // Publish using a string literal with the same content; broker matches by value.
+    broker.publish("sensor/temp", null);
+    try std.testing.expectEqual(@as(u32, 1), count);
+
+    broker.unsubscribe(h);
+    broker.publish("sensor/temp", null);
+    try std.testing.expectEqual(@as(u32, 1), count); // no longer subscribed
+}
+
+test "copy_topics=true: subscribe same topic twice reuses the stored key" {
+    const C = Broker(.{ .copy_topics = true });
+    var broker = C.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var a: u32 = 0;
+    var b: u32 = 0;
+    _ = try broker.subscribe("t", counterCb, &a);
+    _ = try broker.subscribe("t", counterCb, &b); // second sub reuses existing key
+
+    broker.publish("t", null);
+    try std.testing.expectEqual(@as(u32, 1), a);
+    try std.testing.expectEqual(@as(u32, 1), b);
+}
+
+test "copy_topics=true: unsubscribe last subscriber frees owned key — no leak" {
+    const C = Broker(.{ .copy_topics = true });
+    var broker = C.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    const h = try broker.subscribe("x/y", counterCb, &count);
+    broker.unsubscribe(h);
+    // testing.allocator verifies the key was freed (no leak on deinit).
+    broker.publish("x/y", null);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "copy_topics=true: clearTopic frees owned key — no leak" {
+    const C = Broker(.{ .copy_topics = true });
+    var broker = C.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    _ = try broker.subscribe("a/b", counterCb, &count);
+    _ = try broker.subscribe("a/b", counterCb, &count);
+    broker.clearTopic("a/b");
+    // testing.allocator confirms the key allocation was freed.
+}
+
+test "copy_topics=true: deinit with active subscriptions does not leak" {
+    const C = Broker(.{ .copy_topics = true });
+    var broker = C.init(std.testing.allocator);
+    var count: u32 = 0;
+    _ = try broker.subscribe("p/q", counterCb, &count);
+    _ = try broker.subscribe("r", counterCb, &count);
+    broker.deinit(); // testing.allocator verifies all keys and lists are freed
+}
+
+test "copy_topics=true: subscribe is OOM-safe at every allocation point" {
+    const C = Broker(.{ .copy_topics = true });
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var fa = std.testing.FailingAllocator.init(
+            std.testing.allocator,
+            .{ .fail_index = fail_index },
+        );
+        var broker = C.init(fa.allocator());
+        var count: u32 = 0;
+        if (broker.subscribe("t", counterCb, &count)) |_| {
+            broker.deinit();
+            break;
+        } else |_| {
+            broker.deinit();
+        }
+    }
 }

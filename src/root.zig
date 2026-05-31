@@ -33,7 +33,15 @@ const pubsub = @import("pubsub.zig");
 const typed_broker = @import("typed_broker.zig");
 
 // Hoist the most-used names to the package root for ergonomic imports.
-pub const Broker = pubsub.Broker;
+/// Default (non-copying) broker type. Equivalent to `BrokerWith(.{})`.
+/// Topic slices passed to `subscribe` must outlive their Handle.
+pub const Broker = pubsub.Broker(.{});
+/// Options struct for the parametric broker constructor.
+pub const BrokerOptions = pubsub.BrokerOptions;
+/// Parametric broker constructor. Use when you need `copy_topics` or future options:
+///
+///   var b = ratatoskr.BrokerWith(.{ .copy_topics = true }).init(allocator);
+pub const BrokerWith = pubsub.Broker;
 pub const Handle = pubsub.Handle;
 pub const CallbackFn = pubsub.CallbackFn;
 pub const TOPIC_SEPARATOR = pubsub.TOPIC_SEPARATOR;
