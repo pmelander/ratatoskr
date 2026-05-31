@@ -31,6 +31,7 @@ const std = @import("std");
 // Internal sub-modules — not pub so consumers only see the hoisted names below.
 const pubsub = @import("pubsub.zig");
 const typed_broker = @import("typed_broker.zig");
+const static_broker = @import("static_broker.zig");
 
 // Hoist the most-used names to the package root for ergonomic imports.
 /// Default (non-copying) broker type. Equivalent to `BrokerWith(.{})`.
@@ -46,6 +47,14 @@ pub const Handle = pubsub.Handle;
 pub const CallbackFn = pubsub.CallbackFn;
 pub const TOPIC_SEPARATOR = pubsub.TOPIC_SEPARATOR;
 pub const TypedBroker = typed_broker.TypedBroker;
+/// Zero-allocation, freestanding-safe broker with a comptime-fixed topic set.
+///
+///   const Events = ratatoskr.StaticBroker(
+///       &.{ "sensors/temp", "ui/button" },
+///       8,
+///   );
+///   var broker = Events.init();
+pub const StaticBroker = static_broker.StaticBroker;
 
 test {
     // refAllDecls only sees pub decls of @This(); explicitly reference each
@@ -53,4 +62,5 @@ test {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(pubsub);
     std.testing.refAllDecls(typed_broker);
+    std.testing.refAllDecls(static_broker);
 }
