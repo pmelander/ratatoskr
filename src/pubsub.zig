@@ -69,6 +69,13 @@ const SubList = std.ArrayList(Subscriber);
 ///   const h = try broker.subscribe("app/ui", myCallback, null);
 ///   broker.publish("app/ui/button", &some_data);  // myCallback is invoked
 ///   broker.unsubscribe(h);
+///
+/// **Thread safety**: not thread-safe; callers own synchronisation.
+///
+/// **Re-entrancy**: calling `publish` from within a callback dispatched by the
+/// same broker is not supported and triggers a `std.debug.assert` failure in
+/// debug and ReleaseSafe builds.  Design callbacks to defer follow-up publishes
+/// (e.g. via a queue) rather than calling back into the broker directly.
 pub const Broker = struct {
     allocator: std.mem.Allocator,
     /// Map from topic string → ordered list of active subscribers.
@@ -77,6 +84,9 @@ pub const Broker = struct {
     cache: std.StringHashMap(SubList),
     /// Monotonically increasing counter used to generate unique Handle ids.
     next_id: u64,
+    /// Set to `true` for the duration of a `publish` call.
+    /// Used to detect and reject re-entrant publishes in debug builds.
+    publishing: bool,
 
     /// Initialise a Broker backed by `allocator`.
     /// Call `deinit` to release all resources.
@@ -85,6 +95,7 @@ pub const Broker = struct {
             .allocator = allocator,
             .cache = std.StringHashMap(SubList).init(allocator),
             .next_id = 0,
+            .publishing = false,
         };
     }
 
@@ -167,11 +178,17 @@ pub const Broker = struct {
     /// Delivery order within a single topic level: most-recently-subscribed
     /// first (matching Subtopic's reverse-iteration behaviour).
     /// Ancestor topics are visited from the published topic toward the root.
+    ///
+    /// Calling `publish` re-entrantly from within a callback is not supported
+    /// and panics in debug/ReleaseSafe builds.
     pub fn publish(
         self: *Broker,
         topic: []const u8,
         data: ?*anyopaque,
     ) void {
+        std.debug.assert(!self.publishing); // re-entrant publish is not allowed
+        self.publishing = true;
+        defer self.publishing = false;
         var current: []const u8 = topic;
         while (true) {
             if (self.cache.getPtr(current)) |list| {
@@ -544,4 +561,32 @@ test "subscribe is OOM-safe at every allocation point" {
             broker.deinit(); // must not crash or leak on any OOM path
         }
     }
+}
+
+// --- re-entrancy guard ---
+
+test "re-entrancy guard: publishing flag clears after publish returns" {
+    // Verifies that sequential publishes succeed — the guard flag is correctly
+    // reset via defer even when the subscriber list is non-empty.
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    _ = try broker.subscribe("t", counterCb, &count);
+    broker.publish("t", null);
+    broker.publish("t", null); // must not trigger the re-entrancy assert
+    try std.testing.expectEqual(@as(u32, 2), count);
+}
+
+test "re-entrancy guard: flag is false on a broker that has never published" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    try std.testing.expect(!broker.publishing);
+}
+
+test "re-entrancy guard: flag is false after publish with no subscribers" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    broker.publish("empty", null);
+    try std.testing.expect(!broker.publishing);
 }

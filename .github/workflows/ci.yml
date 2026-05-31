@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Build (debug)
+        run: zig build
+
+      - name: Test
+        run: zig build test --summary all
+
+      - name: Format check
+        run: zig build fmt-check
+
+  cross-compile:
+    name: Cross-compile (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-musl
+          - arm-linux-musleabihf
+          - riscv64-linux-musl
+          - x86_64-windows-gnu
+          - aarch64-macos
+          - wasm32-freestanding
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.16.0
+        uses: mlugg/setup-zig@v2
+        with:
+          version: "0.16.0"
+
+      - name: Cross-compile for ${{ matrix.target }}
+        run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
