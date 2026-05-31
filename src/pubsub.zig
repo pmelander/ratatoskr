@@ -175,6 +175,7 @@ pub fn Broker(comptime options: BrokerOptions) type {
                 }
                 return err;
             };
+            std.debug.assert(self.next_id != std.math.maxInt(u64)); // id exhaustion guard
             self.next_id += 1;
             return .{ .topic = gop.key_ptr.*, .id = id };
         }
@@ -209,6 +210,89 @@ pub fn Broker(comptime options: BrokerOptions) type {
                 list.deinit(self.allocator);
                 if (comptime options.copy_topics) self.allocator.free(kv.key);
             }
+        }
+
+        /// Remove ALL subscriptions across every topic.
+        ///
+        /// After this call, the broker is empty and ready for reuse.
+        /// Map capacity is retained to avoid reallocating on the next round
+        /// of subscriptions.
+        pub fn clearAll(self: *Self) void {
+            var it = self.cache.iterator();
+            while (it.next()) |entry| {
+                entry.value_ptr.deinit(self.allocator);
+                if (comptime options.copy_topics) {
+                    self.allocator.free(entry.key_ptr.*);
+                }
+            }
+            self.cache.clearRetainingCapacity();
+        }
+
+        /// Returns the number of active subscribers on exactly `topic`.
+        /// Returns 0 if `topic` has no subscribers.
+        pub fn subscriberCount(self: *Self, topic: []const u8) usize {
+            const list = self.cache.getPtr(topic) orelse return 0;
+            return list.items.len;
+        }
+
+        /// Returns an iterator that yields each topic string currently holding
+        /// at least one subscriber.
+        ///
+        /// The iterator is invalidated by any mutating operation on the broker.
+        pub fn topicIterator(self: *Self) std.StringHashMap(SubList).KeyIterator {
+            return self.cache.keyIterator();
+        }
+
+        /// Storage for a `subscribeOnce` registration.
+        ///
+        /// Declare one of these (typically stack-allocated) and keep it alive
+        /// until the callback fires.
+        pub const OnceCtx = struct {
+            broker: *Self,
+            handle: Handle,
+            callback: CallbackFn,
+            ctx: ?*anyopaque,
+        };
+
+        /// Raw shim for `subscribeOnce`: unsubscribes itself then calls the user callback.
+        fn onceFn(topic: []const u8, data: ?*anyopaque, ctx: ?*anyopaque) void {
+            const oc: *OnceCtx = @ptrCast(@alignCast(ctx.?));
+            // Unsubscribe before invoking the user callback so that the user
+            // callback may re-subscribe without interference.
+            // Calling unsubscribe from within a publish dispatch is safe:
+            // only re-entrant *publish* is guarded; unsubscribe is not.
+            oc.broker.unsubscribe(oc.handle);
+            oc.callback(topic, data, oc.ctx);
+        }
+
+        /// Subscribe `callback`+`ctx` for a single delivery on `topic`.
+        /// After the first publish that matches, the subscription is automatically
+        /// cancelled before `callback` is invoked.
+        ///
+        /// `once_buf` must remain valid until the callback fires (or until you
+        /// manually call `unsubscribe(returned_handle)` to cancel early).
+        /// Typically stack-allocated at the enclosing scope:
+        ///
+        ///   var once: Broker(.{}).OnceCtx = undefined;
+        ///   _ = try broker.subscribeOnce("t", cb, ctx, &once);
+        ///
+        /// Errors: `error.OutOfMemory` — broker state unchanged.
+        pub fn subscribeOnce(
+            self: *Self,
+            topic: []const u8,
+            callback: CallbackFn,
+            ctx: ?*anyopaque,
+            once_buf: *OnceCtx,
+        ) error{OutOfMemory}!Handle {
+            once_buf.* = .{
+                .broker = self,
+                .handle = undefined, // filled in below after subscribe returns
+                .callback = callback,
+                .ctx = ctx,
+            };
+            const handle = try self.subscribe(topic, onceFn, @ptrCast(once_buf));
+            once_buf.handle = handle;
+            return handle;
         }
 
         /// Deliver `data` to all subscribers of `topic` and every ancestor topic.
@@ -809,4 +893,178 @@ test "copy_topics=true: subscribe is OOM-safe at every allocation point" {
             broker.deinit();
         }
     }
+}
+
+// --- subscriberCount ---
+
+test "subscriberCount returns 0 for an unknown topic" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+    try std.testing.expectEqual(@as(usize, 0), broker.subscriberCount("absent"));
+}
+
+test "subscriberCount returns the number of active subscribers" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    try std.testing.expectEqual(@as(usize, 0), broker.subscriberCount("t"));
+    _ = try broker.subscribe("t", counterCb, &count);
+    try std.testing.expectEqual(@as(usize, 1), broker.subscriberCount("t"));
+    _ = try broker.subscribe("t", counterCb, &count);
+    try std.testing.expectEqual(@as(usize, 2), broker.subscriberCount("t"));
+}
+
+test "subscriberCount drops to 0 after unsubscribing the last subscriber" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    const h = try broker.subscribe("t", counterCb, &count);
+    try std.testing.expectEqual(@as(usize, 1), broker.subscriberCount("t"));
+    broker.unsubscribe(h);
+    try std.testing.expectEqual(@as(usize, 0), broker.subscriberCount("t"));
+}
+
+// --- topicIterator ---
+
+test "topicIterator yields all subscribed topics" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    _ = try broker.subscribe("a", counterCb, &count);
+    _ = try broker.subscribe("b", counterCb, &count);
+    _ = try broker.subscribe("a", counterCb, &count); // duplicate — should yield "a" once
+
+    var seen_a = false;
+    var seen_b = false;
+    var total: usize = 0;
+    var it = broker.topicIterator();
+    while (it.next()) |topic| {
+        total += 1;
+        if (std.mem.eql(u8, topic.*, "a")) seen_a = true;
+        if (std.mem.eql(u8, topic.*, "b")) seen_b = true;
+    }
+    try std.testing.expect(seen_a);
+    try std.testing.expect(seen_b);
+    try std.testing.expectEqual(@as(usize, 2), total);
+}
+
+test "topicIterator returns empty iterator when no subscriptions exist" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+    var it = broker.topicIterator();
+    try std.testing.expectEqual(@as(?*[]const u8, null), it.next());
+}
+
+// --- clearAll ---
+
+test "clearAll stops delivery on all topics" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var a: u32 = 0;
+    var b: u32 = 0;
+    _ = try broker.subscribe("x", counterCb, &a);
+    _ = try broker.subscribe("y", counterCb, &b);
+
+    broker.clearAll();
+    broker.publish("x", null);
+    broker.publish("y", null);
+    try std.testing.expectEqual(@as(u32, 0), a);
+    try std.testing.expectEqual(@as(u32, 0), b);
+}
+
+test "clearAll does not leak — testing.allocator verifies" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+    var count: u32 = 0;
+    _ = try broker.subscribe("p", counterCb, &count);
+    _ = try broker.subscribe("q", counterCb, &count);
+    broker.clearAll(); // all allocations must be freed here
+}
+
+test "clearAll: broker is reusable after clearing" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    _ = try broker.subscribe("t", counterCb, &count);
+    broker.clearAll();
+
+    // Re-subscribe and verify delivery works normally.
+    _ = try broker.subscribe("t", counterCb, &count);
+    broker.publish("t", null);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "clearAll with copy_topics=true frees owned keys — no leak" {
+    const C = Broker(.{ .copy_topics = true });
+    var broker = C.init(std.testing.allocator);
+    defer broker.deinit();
+    var count: u32 = 0;
+    _ = try broker.subscribe("m", counterCb, &count);
+    _ = try broker.subscribe("n", counterCb, &count);
+    broker.clearAll();
+}
+
+// --- subscribeOnce ---
+
+test "subscribeOnce fires the callback exactly once" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    var once: B.OnceCtx = undefined;
+    _ = try broker.subscribeOnce("t", counterCb, &count, &once);
+
+    broker.publish("t", null); // fires once, auto-unsubscribes
+    broker.publish("t", null); // no subscriber → no-op
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "subscribeOnce does not interfere with other subscribers on the same topic" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var once_count: u32 = 0;
+    var perm_count: u32 = 0;
+    var once: B.OnceCtx = undefined;
+    _ = try broker.subscribeOnce("t", counterCb, &once_count, &once);
+    _ = try broker.subscribe("t", counterCb, &perm_count);
+
+    broker.publish("t", null);
+    try std.testing.expectEqual(@as(u32, 1), once_count); // fired once
+    try std.testing.expectEqual(@as(u32, 1), perm_count);
+
+    broker.publish("t", null);
+    try std.testing.expectEqual(@as(u32, 1), once_count); // not again
+    try std.testing.expectEqual(@as(u32, 2), perm_count); // permanent subscriber fires again
+}
+
+test "subscribeOnce: early manual cancel via unsubscribe prevents any delivery" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    var once: B.OnceCtx = undefined;
+    const h = try broker.subscribeOnce("t", counterCb, &count, &once);
+
+    broker.unsubscribe(h); // cancel before any publish
+    broker.publish("t", null);
+    try std.testing.expectEqual(@as(u32, 0), count);
+}
+
+test "subscribeOnce: hierarchical bubble-up also triggers auto-unsubscribe" {
+    var broker = B.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    var once: B.OnceCtx = undefined;
+    _ = try broker.subscribeOnce("a", counterCb, &count, &once);
+
+    broker.publish("a/b", null); // fires via ancestor walk, then auto-unsubscribes
+    broker.publish("a/b", null);
+    try std.testing.expectEqual(@as(u32, 1), count);
 }
