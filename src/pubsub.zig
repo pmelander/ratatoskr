@@ -204,6 +204,30 @@ pub const Broker = struct {
             current = current[0..sep];
         }
     }
+
+    /// Deliver `data` to subscribers of `topic` only — no ancestor walk.
+    ///
+    /// Use for point-to-point delivery where ancestor topics must not receive
+    /// messages intended for a specific sub-topic.
+    /// Delivery order: most-recently-subscribed first (LIFO), same as `publish`.
+    ///
+    /// Panics on re-entrant calls in debug/ReleaseSafe builds.
+    pub fn publishExact(
+        self: *Broker,
+        topic: []const u8,
+        data: ?*anyopaque,
+    ) void {
+        std.debug.assert(!self.publishing); // re-entrant publish is not allowed
+        self.publishing = true;
+        defer self.publishing = false;
+        if (self.cache.getPtr(topic)) |list| {
+            var i: usize = list.items.len;
+            while (i > 0) {
+                i -= 1;
+                list.items[i].callback(topic, data, list.items[i].ctx);
+            }
+        }
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -589,4 +613,66 @@ test "re-entrancy guard: flag is false after publish with no subscribers" {
     defer broker.deinit();
     broker.publish("empty", null);
     try std.testing.expect(!broker.publishing);
+}
+
+// --- publishExact ---
+
+test "publishExact fires exact topic only — not ancestors" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var root: u32 = 0;
+    var child: u32 = 0;
+    _ = try broker.subscribe("a", counterCb, &root);
+    _ = try broker.subscribe("a/b", counterCb, &child);
+
+    broker.publishExact("a/b", null);
+    try std.testing.expectEqual(@as(u32, 0), root); // ancestor must NOT fire
+    try std.testing.expectEqual(@as(u32, 1), child); // exact match fires
+}
+
+test "publishExact does not trickle down to children" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var child: u32 = 0;
+    _ = try broker.subscribe("a/b/c", counterCb, &child);
+
+    broker.publishExact("a/b", null);
+    try std.testing.expectEqual(@as(u32, 0), child);
+}
+
+test "publishExact on a topic with no subscribers is a no-op" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+    broker.publishExact("never/subscribed", null);
+}
+
+test "publishExact LIFO order matches publish" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var seq: u32 = 0;
+    var fired_at_1: u32 = 999;
+    var fired_at_2: u32 = 999;
+    var ctx1 = SeqCtx{ .seq = &seq, .fired_at = &fired_at_1 };
+    var ctx2 = SeqCtx{ .seq = &seq, .fired_at = &fired_at_2 };
+
+    _ = try broker.subscribe("t", seqCb, &ctx1); // subscribed first  → fires second
+    _ = try broker.subscribe("t", seqCb, &ctx2); // subscribed second → fires first
+
+    broker.publishExact("t", null);
+    try std.testing.expectEqual(@as(u32, 0), fired_at_2);
+    try std.testing.expectEqual(@as(u32, 1), fired_at_1);
+}
+
+test "publishExact re-entrancy guard: flag clears after return" {
+    var broker = Broker.init(std.testing.allocator);
+    defer broker.deinit();
+
+    var count: u32 = 0;
+    _ = try broker.subscribe("t", counterCb, &count);
+    broker.publishExact("t", null);
+    broker.publishExact("t", null); // second call must not hit the assert
+    try std.testing.expectEqual(@as(u32, 2), count);
 }
