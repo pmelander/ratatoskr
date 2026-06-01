@@ -1,0 +1,6 @@
+# Enforce LF line endings for Zig source files on all platforms.
+# zig fmt always emits LF; CRLF checkout on Windows causes fmt-check to fail.
+* text=auto
+*.zig text eol=lf
+*.zon text eol=lf
+build.zig text eol=lf
