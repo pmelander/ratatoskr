@@ -32,6 +32,8 @@ const std = @import("std");
 const pubsub = @import("pubsub.zig");
 const typed_broker = @import("typed_broker.zig");
 const static_broker = @import("static_broker.zig");
+const sync_broker = @import("sync_broker.zig");
+const event_queue = @import("event_queue.zig");
 
 // Hoist the most-used names to the package root for ergonomic imports.
 /// Default (non-copying) broker type. Equivalent to `BrokerWith(.{})`.
@@ -56,6 +58,39 @@ pub const TypedBroker = typed_broker.TypedBroker;
 ///   var broker = Events.init();
 pub const StaticBroker = static_broker.StaticBroker;
 
+// ---- Thread safety and cross-thread dispatch --------------------------------
+
+/// Freestanding-safe spinlock (atomic bool, no OS dependency).
+/// Use as the `Lock` parameter for `LockedBroker` or `EventQueue` on
+/// bare-metal / RTOS targets.  On hosted targets, prefer `std.Thread.Mutex`.
+pub const SpinLock = sync_broker.SpinLock;
+
+/// Wraps any broker type with mutual exclusion.
+///
+///   const SyncBroker = ratatoskr.LockedBroker(ratatoskr.Broker, std.Thread.Mutex);
+///   var b = SyncBroker.init(ratatoskr.Broker.init(alloc), .{});
+///
+///   const SyncStatic = ratatoskr.LockedBroker(Events, ratatoskr.SpinLock);
+///   var b = SyncStatic.init(Events.init(), ratatoskr.SpinLock.init());
+pub const LockedBroker = sync_broker.LockedBroker;
+
+/// MPSC ring buffer for cross-thread broker dispatch.
+/// Producers call `tryPost`; the consumer calls `drain(broker)`.
+///
+///   const Q = ratatoskr.EventQueue(16, 64, 32, 4, ratatoskr.SpinLock);
+///   var q = Q.init(ratatoskr.SpinLock.init());
+pub const EventQueue = event_queue.EventQueue;
+
+/// Convenience alias: `EventQueue` with `NullLock` for single-producer use.
+///
+///   const Q = ratatoskr.SpscEventQueue(16, 64, 0, 1);
+///   var q = Q.init(ratatoskr.NullLock.init());
+pub const SpscEventQueue = event_queue.SpscEventQueue;
+
+/// No-op lock for single-producer `EventQueue` use.
+/// Compiles away entirely in optimised builds.
+pub const NullLock = event_queue.NullLock;
+
 test {
     // refAllDecls only sees pub decls of @This(); explicitly reference each
     // sub-module so all their tests are compiled and discovered by the runner.
@@ -63,4 +98,6 @@ test {
     std.testing.refAllDecls(pubsub);
     std.testing.refAllDecls(typed_broker);
     std.testing.refAllDecls(static_broker);
+    std.testing.refAllDecls(sync_broker);
+    std.testing.refAllDecls(event_queue);
 }
